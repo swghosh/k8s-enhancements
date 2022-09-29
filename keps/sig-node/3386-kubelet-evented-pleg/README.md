@@ -13,9 +13,9 @@
   - [Risks and Mitigations](#risks-and-mitigations)
 - [Design Details](#design-details)
   - [Feature Gate](#feature-gate)
+  - [Timestamp of the Pod Status](#timestamp-of-the-pod-status)
   - [Runtime Service Changes](#runtime-service-changes)
-  - [Kubelet Changes](#kubelet-changes)
-    - [Pod Status Update in the Cache](#pod-status-update-in-the-cache)
+  - [Pod Status Update in the Cache](#pod-status-update-in-the-cache)
   - [Test Plan](#test-plan)
       - [Prerequisite testing updates](#prerequisite-testing-updates)
       - [Unit tests](#unit-tests)
@@ -134,30 +134,31 @@ This might be a good place to talk about core concepts and how they relate.
   - Users can disable this feature to make kubelet use existing relisting based PLEG.
 - Another risk is the CRI implementation could have a buggy event emitting system, and miss pod lifecycle events.
   - A mitigation is a `kube_pod_missed_events` metric, which the Kubelet could report when a lifecycle event is registered that wasn't triggered by an event, but rather by changes of state between lists.
+  - While using the Evented implementation, the periodic relisting functionality would still be used with an increased interval which should work as a fallback mechanism for missed events in case of any disruptions.
 
 ## Design Details
 
 Kubelet generates [PodLifecycleEvent](https://github.com/kubernetes/kubernetes/blob/release-1.24/pkg/kubelet/pleg/pleg.go#L41) using [relisting](https://github.com/kubernetes/kubernetes/blob/050f930f8968874855eb215f0c0f0877bcdaa0e8/pkg/kubelet/pleg/generic.go#L150). These `PodLifecycleEvents` get [used](https://github.com/kubernetes/kubernetes/blob/050f930f8968874855eb215f0c0f0877bcdaa0e8/pkg/kubelet/kubelet.go#L2060) in kubelet's sync loop to infer the state of the container. e.g. to determine if the [container has died](https://github.com/kubernetes/kubernetes/blob/050f930f8968874855eb215f0c0f0877bcdaa0e8/pkg/kubelet/kubelet.go#L2118).
 
 
- The idea behind this enhancment is, kubelet will receive the [CRI events](###Runtime-Service-Changes) mentioned above from the CRI runtime and generate the corresponding `PodLifecycleEvent`. This will reduce kubelet's dependency on relisting to generate `PodLifecycleEvent` and that event will be immediately available within sync loop instead of waiting for relisting to finish. Kubelet will still do relisting but with a reduced frequency.
+ The idea behind this enhancment is, kubelet will receive the [CRI events](#Runtime-Service-Changes) mentioned above from the CRI runtime and generate the corresponding `PodLifecycleEvent`. This will reduce kubelet's dependency on relisting to generate `PodLifecycleEvent` and that event will be immediately available within sync loop instead of waiting for relisting to finish. Kubelet will still do relisting but with a reduced frequency.
 ### Feature Gate
-This feature can only be enabled using the feature gate `EventedPLEG`.
+This feature can only be used when `EventedPLEG` feature gate is enabled.
 
 ### Timestamp of the Pod Status
-![alt text](./existing-generic-pleg.png "Existing Generic PLEG")
+![Existing Generic PLEG](./existing-generic-pleg.png)
 
-Kubelet cache saves the [pod status with the timestamp](https://github.com/kubernetes/kubernetes/blob/c012d901d8bee86ef3e3c9472a1a4a0368a34775/pkg/kubelet/pleg/generic.go#L426). The value of this timestamp is calculated [within kubelet process](https://github.com/kubernetes/kubernetes/blob/c012d901d8bee86ef3e3c9472a1a4a0368a34775/pkg/kubelet/pleg/generic.go#L399). This works fine when there is only Generic PLEG at work as it will calculate the timestamp and then fetch the `PodStatus` to save in the cache.
+Kubelet cache saves the [pod status with the timestamp](https://github.com/kubernetes/kubernetes/blob/c012d901d8bee86ef3e3c9472a1a4a0368a34775/pkg/kubelet/pleg/generic.go#L426). The value of this timestamp is calculated [within the kubelet process](https://github.com/kubernetes/kubernetes/blob/c012d901d8bee86ef3e3c9472a1a4a0368a34775/pkg/kubelet/pleg/generic.go#L399). This works fine when there is only Generic PLEG at work as it will calculate the timestamp first and then fetch the `PodStatus` to save it in the cache.
 
-If we have multiple entities, such as `Evented PLEG`, trying to set the `PodStatus` in the cache we may run into the racy timestamps if each of them calculates the timestamp in their respective execution flow. While `Generic PLEG` calculates this timestamp and gets the `PodStatus`, we can only calculate the corresponding timestamp in `Evented PLEG` after the event has been received by the Kubelet. Any disruptions in getting the events, such as errors in the grpc connection, might skew our calculation of the time in the kubelet for the `Evented PLEG`.
+As of today, the `PodStatus` is saved in the cache without any validation of the existing status against the current timestamp. This works well when there is only `Generic PLEG` setting the `PodStatus` in the cache. 
 
-Today the `PodStatus` is saved in the cache without any validation of the existing status against the current timestamp. This works well with when there is only `Generic PLEG` setting the `PodStatus` in the cache. This should prevent any old buffered `PodStatus` overriding the newer entry in the cache.
+If we have multiple entities, such as `Evented PLEG`, while trying to set the `PodStatus` in the cache we may run into the racy timestamps given each of them were to calculate the timestamps in their respective execution flow. While `Generic PLEG` calculates this timestamp and gets the `PodStatus`, we can only calculate the corresponding timestamp in `Evented PLEG` after the event has been received by the Kubelet. Any disruptions in getting the events, such as errors in the grpc connection, might skew our calculation of the time in the kubelet for the `Evented PLEG`.
 
-In order to address the issues above, we propose that existing `Generic PLEG` as well as `Evented PLEG` should rely on the CRI Runtime for the timestamp of the `PodStatus`. This way the `PodStatus` would also be a bit more closer to the actual time when the statuses of the `Sandboxes` and `Containers` where provided by the CRI Runtime. It will enable us to correctly compare the timestamps before saving them in the cache, to avoid the erroneous behaviour.
+In order to address the issues above, we propose that existing `Generic PLEG` as well as `Evented PLEG` should rely on the CRI Runtime for the timestamp of the `PodStatus`. This way the `PodStatus` would also be a bit more closer to the actual time when the statuses of the `Sandboxes` and `Containers` where provided by the CRI Runtime. It will enable us to correctly compare the timestamps before saving them in the cache, to avoid the erroneous behaviour. This should also prevent any old buffered `PodStatus` (consolidated during any disruptions or failures) from overriding the newer entry in the cache.
 
-![alt text](./modified-generic-pleg.png "Existing Generic PLEG")
+![Modified Generic PLEG](./modified-generic-pleg.png "Existing Generic PLEG")
 
-![alt text](./evented-pleg.png "Existing Generic PLEG")
+![Evented PLEG](./evented-pleg.png)
 
 
 ### Runtime Service Changes
@@ -241,7 +242,7 @@ At present kubelet updates the cache using the [Set function](https://github.com
 
 Pod status should be updated in the cache only if the new status update has timestamp newer than the timestamp of the already present in the cache.
 
-![alt text](./modified-cache-setter.png "Existing Generic PLEG")
+![Modified Cache Setter](./modified-cache-setter.png)
 
 ```go
 func (c *cache) Set(id types.UID, status *PodStatus, err error, timestamp time.Time) (updated bool) {
